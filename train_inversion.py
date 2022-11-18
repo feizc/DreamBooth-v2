@@ -16,9 +16,10 @@ from torchvision import transforms
 from PIL import Image 
 
 
-from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionPipeline, UNet2DConditionModel
+from diffusers import AutoencoderKL, PNDMScheduler, DDPMScheduler, StableDiffusionPipeline, UNet2DConditionModel
 from diffusers.optimization import get_scheduler
-from transformers import CLIPTextModel, CLIPTokenizer 
+from diffusers.pipelines.stable_diffusion import StableDiffusionSafetyChecker
+from transformers import CLIPTextModel, CLIPTokenizer, CLIPFeatureExtractor
 
 
 def save_progress(text_encoder,  placeholder_token_id, args):
@@ -45,7 +46,7 @@ def parse_args():
     parser.add_argument(
         "--placeholder_token",
         type=str,
-        default='<style>',
+        default='<sks>',
         help="A token to use as a placeholder for the concept.",
     )
     parser.add_argument(
@@ -136,7 +137,8 @@ def parse_args():
     parser.add_argument("--adam_weight_decay", type=float, default=1e-2, help="Weight decay to use.")
     parser.add_argument("--adam_epsilon", type=float, default=1e-08, help="Epsilon value for the Adam optimizer")
     parser.add_argument("--train_text_encoder", type=bool, default=False, help="Whether to train the text encoder")
-    parser.add_argument("--debug", type=bool, default=True, help="Debug the training.")
+    parser.add_argument("--repeats", type=int, default=10, help="How many times to repeat the training data.")
+    parser.add_argument("--debug", type=bool, default=False, help="Debug the training.")
     args = parser.parse_args()
     return args 
 
@@ -240,8 +242,10 @@ class TextualInversionDataset(Dataset):
 
     def __getitem__(self, i):
         example = {}
-        image = Image.open(self.image_paths[i % self.num_images])
-
+        try:
+            image = Image.open(self.image_paths[i % self.num_images])
+        except:
+            image = Image.open(self.image_paths[(i+1) % self.num_images])
         if not image.mode == "RGB":
             image = image.convert("RGB")
 
@@ -285,11 +289,11 @@ def freeze_params(params):
 
 def main():
     args = parse_args() 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
 
     tokenizer = CLIPTokenizer.from_pretrained(
-            args.pretrained_model_path,
-            subfolder="tokenizer",
+            os.path.join(args.pretrained_model_path, "tokenizer")
+
         )
 
     # Add the placeholder token in tokenizer
@@ -311,8 +315,8 @@ def main():
     
     # Load models
     text_encoder = CLIPTextModel.from_pretrained(
-        args.pretrained_model_path,
-        subfolder="text_encoder",
+        os.path.join(args.pretrained_model_path, "text_encoder")
+        #subfolder="text_encoder",
     )
     # Resize the token embeddings as we are adding new special tokens to the tokenizer
     text_encoder.resize_token_embeddings(len(tokenizer))
@@ -322,12 +326,12 @@ def main():
 
 
     vae = AutoencoderKL.from_pretrained(
-        args.pretrained_model_path,
-        subfolder="vae",
+        os.path.join(args.pretrained_model_path,"vae")
+        #subfolder="vae",
     )
     unet = UNet2DConditionModel.from_pretrained(
-        args.pretrained_model_path,
-        subfolder="unet",
+        os.path.join(args.pretrained_model_path,"unet")
+        #subfolder="unet",
     )
 
     # Freeze vae and unet
@@ -403,14 +407,15 @@ def main():
     global_step = 0
 
     print('begin to training') 
-    for epoch in range(args.num_train_epochs):
+    #for epoch in range(args.num_train_epochs):
+    for epoch in range(5):
         text_encoder.train()
         loss_cum = 0
         iteration = 0
         with tqdm(enumerate(train_dataloader), total=len(train_dataloader)) as t:
             for step, batch in t: 
                 # Convert images to latent space
-                latents = vae.encode(batch["pixel_values"]).latent_dist.sample().detach()
+                latents = vae.encode(batch["pixel_values"].to(device)).latent_dist.sample().detach()
                 latents = latents * 0.18215
 
                 # Sample noise that we'll add to the latents
@@ -427,7 +432,7 @@ def main():
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
                 # Get the text embedding for conditioning
-                encoder_hidden_states = text_encoder(batch["input_ids"])[0]
+                encoder_hidden_states = text_encoder(batch["input_ids"])[0].to(device)
                 
                 # Predict the noise residual
                 noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample 
@@ -435,8 +440,8 @@ def main():
                 loss = F.mse_loss(noise_pred, noise, reduction="none").mean([1, 2, 3]).mean()
 
                 loss.backward() 
-                if step % args.gradient_accumulation_steps == 0:
-                    torch.nn.utils.clip_grad_norm_(text_encoder.parameters(), args.max_norm)
+                if (step + 1) % args.gradient_accumulation_steps == 0:
+                    # torch.nn.utils.clip_grad_norm_(text_encoder.parameters(), args.max_norm)
                     # Zero out the gradients for all token embeddings except the newly added
                     # embeddings for the concept, as we only want to optimize the concept embeddings
                     grads = text_encoder.get_input_embeddings().weight.grad 
@@ -457,19 +462,27 @@ def main():
                 global_step += 1
                 if global_step % args.save_steps == 0:
                     save_progress(text_encoder, placeholder_token_id, args) 
-                if global_step >= args.max_train_steps:
-                    break
+                    text_encoder.save_pretrained('./tmp')
+                #if global_step >= args.max_train_steps:
+                #    break
                 if args.debug == True: 
                     break 
+    
+    text_encoder.save_pretrained('./tmp') 
 
+    '''
     pipeline = StableDiffusionPipeline(
         text_encoder=text_encoder,
         vae=vae,
         unet=unet,
         tokenizer=tokenizer,
+        scheduler=PNDMScheduler.from_config(os.path.join(args.pretrained_model_path, "scheduler")),
+        safety_checker=StableDiffusionSafetyChecker.from_pretrained(os.path.join(args.pretrained_model_path, 'safety_checker')),
+        #safety_checker=None,
+        feature_extractor=CLIPFeatureExtractor.from_pretrained(os.path.join(args.pretrained_model_path,'feature_extractor')),
     )
-    pipeline.save_pretrained(args.output_dir)
-
+    pipeline.save_pretrained('./tmp')
+    '''
 
 
 if __name__ == '__main__': 
