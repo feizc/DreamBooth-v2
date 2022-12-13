@@ -1,6 +1,6 @@
 # Personalizing Text-to-Image Generation with Multimodal Inversion
 
-As we find that original text inversion struggles with learning precise shapes for objective, we introduce to use learnable image latents to help make a better detail controling. 
+As original text inversion struggles with learning precise shapes for objective, here we introduce to use learnable image latents to help make a better detail controling. 
 
 We make the following points:
 1. Randomness: learn the mean and variance of image latents, and sample an image latents each time; 
@@ -24,7 +24,5 @@ To evaluate the performance of multimodal inversion systerm, run:
 python infer_multimodal_inversion.py
 ```
 
-Moreover, we use a hyper-parameter combine_strength to control the incorporation of image latents. 
-
-
+Moreover, we use a hyper-parameter combine_strength to control the incorporation of image latents to noise initialization like [img2img](https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/stable_diffusion/pipeline_stable_diffusion_img2img.py). 
 
