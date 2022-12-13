@@ -6,7 +6,8 @@ import itertools
 import math 
 import numpy as np 
 import PIL 
-import random 
+import random
+from sklearn.feature_extraction import image 
 from tqdm import tqdm
 
 import torch 
@@ -22,10 +23,14 @@ from diffusers.pipelines.stable_diffusion import StableDiffusionSafetyChecker
 from transformers import CLIPTextModel, CLIPTokenizer, CLIPFeatureExtractor
 
 
-def save_progress(text_encoder,  placeholder_token_id, args):
+
+def save_progress(text_encoder,  image_inversion, placeholder_token_id, args):
     learned_embeds = text_encoder.get_input_embeddings().weight[placeholder_token_id]
     learned_embeds_dict = {args.placeholder_token: learned_embeds.detach().cpu()}
-    torch.save(learned_embeds_dict, os.path.join(args.output_dir, "learned_embeds.bin"))
+    torch.save(learned_embeds_dict, os.path.join(args.output_dir, "learned_embeds.bin")) 
+
+    image_inversion_dict = {'image_inversion': image_inversion}
+    torch.save(image_inversion_dict, os.path.join(args.output_dir, "image_embeds.bin")) 
 
 
 def parse_args():
@@ -34,13 +39,13 @@ def parse_args():
     parser.add_argument(
         "--train_data_dir",
         type=str,
-        default='./data',
+        default='./cat',
         help="A folder containing the training data of instance images.",
     )
     parser.add_argument(
         "--save_steps",
         type=int,
-        default=500,
+        default=5000,
         help="Save learned_embeds.bin every X updates steps.",
     )
     parser.add_argument(
@@ -58,13 +63,13 @@ def parse_args():
     parser.add_argument(
         "--learnable_property", 
         type=str, 
-        default="style", 
+        default="object", 
         help="Choose between 'object' and 'style'"
     )
     parser.add_argument(
         "--instance_prompt",
         type=str,
-        default="a style of skkk",
+        default="a style of <sks>",
         help="The prompt with identifier specifying the instance",
     )
     parser.add_argument(
@@ -137,8 +142,8 @@ def parse_args():
     parser.add_argument("--adam_weight_decay", type=float, default=1e-2, help="Weight decay to use.")
     parser.add_argument("--adam_epsilon", type=float, default=1e-08, help="Epsilon value for the Adam optimizer")
     parser.add_argument("--train_text_encoder", type=bool, default=False, help="Whether to train the text encoder")
-    parser.add_argument("--repeats", type=int, default=10, help="How many times to repeat the training data.")
-    parser.add_argument("--debug", type=bool, default=False, help="Debug the training.")
+    parser.add_argument("--repeats", type=int, default=100, help="How many times to repeat the training data.")
+    parser.add_argument("--debug", type=bool, default=True, help="Debug the training.")
     args = parser.parse_args()
     return args 
 
@@ -194,6 +199,22 @@ imagenet_style_templates_small = [
     "a weird painting in the style of {}",
     "a large painting in the style of {}",
 ]
+
+
+def numpy_to_pil(images):
+    """
+    Convert a numpy image or a batch of images to a PIL image.
+    """
+    if images.ndim == 3:
+        images = images[None, ...]
+    images = (images * 255).round().astype("uint8")
+    if images.shape[-1] == 1:
+        # special case for grayscale (single channel) images
+        pil_images = [Image.fromarray(image.squeeze(), mode="L") for image in images]
+    else:
+        pil_images = [Image.fromarray(image) for image in images]
+
+    return pil_images
 
 
 
@@ -287,6 +308,25 @@ def freeze_params(params):
         param.requires_grad = False
 
 
+
+def average_image_latents(data_loader, vae, args): 
+    if args.debug == True: 
+        max_num = 3
+    else:
+        max_num = 10
+    num = 0
+    for data in tqdm(data_loader): 
+        if num == 0:
+            avg_latents = vae.encode(data["pixel_values"].to(vae.device)).latent_dist.sample().detach()
+        else:
+            avg_latents += vae.encode(data["pixel_values"].to(vae.device)).latent_dist.sample().detach() 
+        num += 1
+        if num > max_num:
+            break 
+    avg_latents /= min(len(data_loader), num)
+    return avg_latents * 0.18215 
+
+
 def main():
     args = parse_args() 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -321,7 +361,7 @@ def main():
     # Initialise the newly added placeholder token with the embeddings of the initializer token
     token_embeds = text_encoder.get_input_embeddings().weight.data
     token_embeds[placeholder_token_id] = token_embeds[initializer_token_id]
-
+    
 
     vae = AutoencoderKL.from_pretrained(
         os.path.join(args.pretrained_model_path,"vae")
@@ -347,14 +387,6 @@ def main():
             args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size
         )
 
-    # Initialize the optimizer
-    optimizer = torch.optim.AdamW(
-        text_encoder.get_input_embeddings().parameters(),  # only optimize the embeddings
-        lr=args.learning_rate,
-        betas=(args.adam_beta1, args.adam_beta2),
-        weight_decay=args.adam_weight_decay,
-        eps=args.adam_epsilon,
-    )
 
     noise_scheduler = DDPMScheduler.from_config(args.pretrained_model_path, subfolder="scheduler") 
 
@@ -371,6 +403,37 @@ def main():
 
     train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=args.train_batch_size, shuffle=True)
 
+    # initialize the image inversion 
+    # average instead of random initialize
+    # image_inversion = torch.nn.Parameter(torch.randn((1, 4, 64, 64))).to(device) 
+    print('begin to initilize image inversion')
+    image_inversion = torch.nn.Parameter(average_image_latents(train_dataloader, vae, args).detach().to(device))
+    image_var_inversion = torch.ones_like(image_inversion, device=device, requires_grad=False) * 1e-6
+    
+    if args.debug == True: 
+        print(image_inversion)
+
+
+    # Initialize the optimizer
+    optimizer_text = torch.optim.AdamW(
+        [   
+            {'params': text_encoder.get_input_embeddings().parameters(), 'lr': args.learning_rate,},
+        ],
+        betas=(args.adam_beta1, args.adam_beta2),
+        weight_decay=args.adam_weight_decay,
+        eps=args.adam_epsilon,
+    )
+
+    optimizer_image = torch.optim.AdamW(
+        [   
+            {'params': image_inversion, 'lr': 1e-3,},
+        ],
+        betas=(args.adam_beta1, args.adam_beta2),
+        weight_decay=args.adam_weight_decay,
+        eps=args.adam_epsilon,
+    )
+
+
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -379,9 +442,16 @@ def main():
         overrode_max_train_steps = True
 
 
-    lr_scheduler = get_scheduler(
+    lr_scheduler_text = get_scheduler(
         args.lr_scheduler,
-        optimizer=optimizer,
+        optimizer=optimizer_text,
+        num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
+        num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
+    )
+
+    lr_scheduler_image = get_scheduler(
+        args.lr_scheduler,
+        optimizer=optimizer_image,
         num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
         num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
     )
@@ -402,9 +472,9 @@ def main():
 
     global_step = 0
 
-    print('begin to training') 
+    print('begin to training for text') 
     #for epoch in range(args.num_train_epochs):
-    for epoch in range(5):
+    for epoch in range(10):
         text_encoder.train()
         loss_cum = 0
         iteration = 0
@@ -412,7 +482,14 @@ def main():
             for step, batch in t: 
                 # Convert images to latent space
                 latents = vae.encode(batch["pixel_values"].to(device)).latent_dist.sample().detach()
-                latents = latents * 0.18215
+                latents = latents * 0.18215 
+                
+                # Sample image inversion
+                #noise = torch.randn(latents.shape).to(latents.device)
+                #t_image_inversion = image_inversion + image_var_inversion * noise
+
+                # Insert image inversion with average
+                # latents = (t_image_inversion + latents) / 2.0
 
                 # Sample noise that we'll add to the latents
                 noise = torch.randn(latents.shape).to(latents.device)
@@ -445,10 +522,11 @@ def main():
                     index_grads_to_zero = torch.arange(len(tokenizer)) != placeholder_token_id 
                     grads.data[index_grads_to_zero, :] = grads.data[index_grads_to_zero, :].fill_(0)
 
-                    optimizer.step()
-                    lr_scheduler.step()
-                    optimizer.zero_grad() 
+                    optimizer_text.step()
+                    lr_scheduler_text.step()
+                    optimizer_text.zero_grad() 
                     if args.debug == True: 
+                        # print(image_inversion) 
                         break
 
                 loss_cum += loss.item()
@@ -456,11 +534,88 @@ def main():
                 t.set_postfix(loss=loss_cum / (iteration+1)) 
                 iteration += 1
                 global_step += 1
-                if global_step % args.save_steps == 0:
-                    save_progress(text_encoder, placeholder_token_id, args) 
-                    text_encoder.save_pretrained('./tmp')
-                #if global_step >= args.max_train_steps:
-                #    break
+
+                if args.debug == True: 
+                    break 
+    
+
+    print('begin to training for image') 
+    #for epoch in range(args.num_train_epochs):
+    for epoch in range(10):
+        text_encoder.eval()
+        loss_cum = 0
+        iteration = 0
+        with tqdm(enumerate(train_dataloader), total=len(train_dataloader)) as t:
+            for step, batch in t: 
+                # Convert images to latent space
+                latents = vae.encode(batch["pixel_values"].to(device)).latent_dist.sample().detach()
+                latents = latents * 0.18215 
+                
+                # Sample image inversion
+                noise = torch.randn(latents.shape).to(latents.device)
+                t_image_inversion = image_inversion + image_var_inversion * noise
+
+                # Insert image inversion with average
+                latents = (t_image_inversion + latents) / 2.0
+
+                # Sample noise that we'll add to the latents
+                noise = torch.randn(latents.shape).to(latents.device)
+                bsz = latents.shape[0]
+                # Sample a random timestep for each image
+                timesteps = torch.randint(
+                    0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device
+                ).long()
+
+
+                # Add noise to the latents according to the noise magnitude at each timestep
+                # (this is the forward diffusion process)
+                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+
+                # Get the text embedding for conditioning
+                encoder_hidden_states = text_encoder(batch["input_ids"])[0].to(device)
+                
+                # Predict the noise residual
+                noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample 
+
+                loss = F.mse_loss(noise_pred, noise, reduction="none").mean([1, 2, 3]).mean()
+
+                loss.backward() 
+                if (step + 1) % args.gradient_accumulation_steps == 0:
+                    # torch.nn.utils.clip_grad_norm_(text_encoder.parameters(), args.max_norm)
+                    # Zero out the gradients for all token embeddings except the newly added
+                    # embeddings for the concept, as we only want to optimize the concept embeddings
+                    # grads = text_encoder.get_input_embeddings().weight.grad 
+                    # Get the index for tokens that we want to zero the grads for
+                    # index_grads_to_zero = torch.arange(len(tokenizer)) != placeholder_token_id 
+                    # grads.data[index_grads_to_zero, :] = grads.data[index_grads_to_zero, :].fill_(0)
+
+                    optimizer_image.step()
+                    lr_scheduler_image.step()
+                    optimizer_image.zero_grad() 
+                    if args.debug == True: 
+                        # print(image_inversion) 
+                        break
+
+                loss_cum += loss.item()
+                t.set_description('Epoch %i' % epoch)
+                t.set_postfix(loss=loss_cum / (iteration+1)) 
+                iteration += 1
+                global_step += 1
+                if args.debug == True or global_step % args.save_steps == 0:
+                    save_progress(text_encoder, image_inversion, placeholder_token_id, args) 
+                    # text_encoder.save_pretrained('./tmp') 
+
+                    # save image inversion 
+                    t_image_inversion = 1 / 0.18215 * image_inversion.detach()
+                    t_image_inversion = vae.decode(t_image_inversion.to(vae.dtype)).sample
+                    t_image_inversion = (t_image_inversion / 2 + 0.5).clamp(0, 1)
+
+                    # we always cast to float32 as this does not cause significant overhead and is compatible with bfloa16
+                    t_image_inversion = t_image_inversion.cpu().permute(0, 2, 3, 1).float().numpy()
+                    t_image_inversion = numpy_to_pil(t_image_inversion)[0] 
+                    t_image_inversion.save('image_inversion.png')
+
+
                 if args.debug == True: 
                     break 
     

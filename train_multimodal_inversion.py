@@ -24,10 +24,13 @@ from transformers import CLIPTextModel, CLIPTokenizer, CLIPFeatureExtractor
 
 
 
-def save_progress(text_encoder,  placeholder_token_id, args):
+def save_progress(text_encoder,  image_inversion, placeholder_token_id, args):
     learned_embeds = text_encoder.get_input_embeddings().weight[placeholder_token_id]
     learned_embeds_dict = {args.placeholder_token: learned_embeds.detach().cpu()}
-    torch.save(learned_embeds_dict, os.path.join(args.output_dir, "learned_embeds.bin"))
+    torch.save(learned_embeds_dict, os.path.join(args.output_dir, "learned_embeds.bin")) 
+
+    image_inversion_dict = {'image_inversion': image_inversion}
+    torch.save(image_inversion_dict, os.path.join(args.output_dir, "image_embeds.bin")) 
 
 
 def parse_args():
@@ -306,12 +309,22 @@ def freeze_params(params):
 
 
 
-def average_image_latents(data_loader, vae): 
-    avg_latents = None
-    for data in data_loader: 
-        avg_latents = vae.encode(data["pixel_values"].to(vae.device)).latent_dist.sample().detach() 
-    avg_latents /= len(data_loader) 
-    return avg_latents
+def average_image_latents(data_loader, vae, args): 
+    if args.debug == True: 
+        max_num = 3
+    else:
+        max_num = 10
+    num = 0
+    for data in tqdm(data_loader): 
+        if num == 0:
+            avg_latents = vae.encode(data["pixel_values"].to(vae.device)).latent_dist.sample().detach()
+        else:
+            avg_latents += vae.encode(data["pixel_values"].to(vae.device)).latent_dist.sample().detach() 
+        num += 1
+        if num > max_num:
+            break 
+    avg_latents /= min(len(data_loader), num)
+    return avg_latents * 0.18215 
 
 
 def main():
@@ -393,7 +406,10 @@ def main():
     # initialize the image inversion 
     # average instead of random initialize
     # image_inversion = torch.nn.Parameter(torch.randn((1, 4, 64, 64))).to(device) 
-    image_inversion = torch.nn.parameter(average_image_latents(train_dataloader, vae).detach())
+    print('begin to initilize image inversion')
+    image_inversion = torch.nn.Parameter(average_image_latents(train_dataloader, vae, args).detach().to(device))
+    image_var_inversion = torch.ones_like(image_inversion, device=device, requires_grad=False) * 1e-6
+    
     if args.debug == True: 
         print(image_inversion)
 
@@ -453,8 +469,12 @@ def main():
                 latents = vae.encode(batch["pixel_values"].to(device)).latent_dist.sample().detach()
                 latents = latents * 0.18215 
                 
+                # Sample image inversion
+                noise = torch.randn(latents.shape).to(latents.device)
+                t_image_inversion = image_inversion + image_var_inversion * noise
+
                 # Insert image inversion with average
-                latents = (image_inversion + latents) / 2.0
+                latents = (t_image_inversion + latents) / 2.0
 
                 # Sample noise that we'll add to the latents
                 noise = torch.randn(latents.shape).to(latents.device)
@@ -499,19 +519,19 @@ def main():
                 t.set_postfix(loss=loss_cum / (iteration+1)) 
                 iteration += 1
                 global_step += 1
-                if global_step % args.save_steps == 0:
-                    save_progress(text_encoder, placeholder_token_id, args) 
-                    text_encoder.save_pretrained('./tmp') 
+                if args.debug == True or global_step % args.save_steps == 0:
+                    save_progress(text_encoder, image_inversion, placeholder_token_id, args) 
+                    # text_encoder.save_pretrained('./tmp') 
 
                     # save image inversion 
-                    image_inversion = 1 / 0.18215 * image_inversion.detach()
-                    image_inversion = vae.decode(image_inversion.to(vae.dtype)).sample
-                    image_inversion = (image_inversion / 2 + 0.5).clamp(0, 1)
+                    t_image_inversion = 1 / 0.18215 * image_inversion.detach()
+                    t_image_inversion = vae.decode(t_image_inversion.to(vae.dtype)).sample
+                    t_image_inversion = (t_image_inversion / 2 + 0.5).clamp(0, 1)
 
                     # we always cast to float32 as this does not cause significant overhead and is compatible with bfloa16
-                    image_inversion = image_inversion.cpu().permute(0, 2, 3, 1).float().numpy()
-                    image_inversion = numpy_to_pil(image_inversion)[0]
-                    image_inversion.save('image_inversion.png')
+                    t_image_inversion = t_image_inversion.cpu().permute(0, 2, 3, 1).float().numpy()
+                    t_image_inversion = numpy_to_pil(t_image_inversion)[0] 
+                    t_image_inversion.save('image_inversion.png')
 
 
                 if args.debug == True: 
