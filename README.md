@@ -24,5 +24,5 @@ To evaluate the performance of multimodal inversion systerm, run:
 python infer_multimodal_inversion.py
 ```
 
-Moreover, we use a hyper-parameter combine_strength to control the incorporation of image latents to noise initialization like [img2img](https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/stable_diffusion/pipeline_stable_diffusion_img2img.py). 
+Moreover, we use a hyper-parameter combine_strength to control the incorporation of image latents to noise initialization referring to [img2img](https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/stable_diffusion/pipeline_stable_diffusion_img2img.py). 
 
