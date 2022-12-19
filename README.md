@@ -1,6 +1,9 @@
-# Personalizing Text-to-Image Generation with Multimodal Inversion
+# Multimodal Inversion
 
-As original text inversion struggles with learning precise shapes for objective, here we introduce to use learnable image latents to help make a better detail controling. 
+
+## What does this repo do?
+We aim to personalize text-to-image generation with multimodal inversion
+As original text inversion struggles with learning precise shapes for objective, here we introduce to use additional learnable image latents to help make a better detail controling. 
 
 We make the following points:
 1. Randomness: learn the mean and variance of image latents, and sample an image latents each time; 
